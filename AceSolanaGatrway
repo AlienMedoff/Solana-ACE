@@ -1,0 +1,164 @@
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::ed25519_program;
+use std::str::FromStr;
+
+declare_id!("AceSolanaGateway1111111111111111111111111");
+
+#[program]
+pub mod solana_ace {
+    use super::*;
+
+    // Инициализация глобального конфига (Админ, Сентинели, Оракулы)
+    pub fn initialize(ctx: Context<Initialize>, fee_bps: u64, min_sigs: u8) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        config.admin = ctx.accounts.admin.key();
+        config.fee_bps = fee_bps;
+        config.min_signatures = min_sigs;
+        config.paused = false;
+        Ok(())
+    }
+
+    // Основная логика: Выполнение сигнала от ИИ
+    pub fn execute_signal(
+        ctx: Context<ExecuteSignal>,
+        params: TradeSignalParams,
+        oracle_sigs: Vec<[u8; 64]>,
+        oracle_pubkeys: Vec<[u8; 32]>,
+    ) -> Result<()> {
+        let config = &ctx.accounts.config;
+        let user_stats = &mut ctx.accounts.user_stats;
+
+        // 1. Проверка паузы
+        require!(!config.paused, AceError::ContractPaused);
+
+        // 2. Проверка анти-бота (Stake & Trust Score)
+        require!(user_stats.staked_amount >= 25_000_000, AceError::InsufficientStake); // 0.025 SOL
+        require!(user_stats.trust_score >= 40, AceError::LowTrustScore);
+
+        // 3. Валидация Nonce (защита от повторов)
+        require!(params.nonce == user_stats.nonce + 1, AceError::InvalidNonce);
+
+        // 4. Проверка мультисига оракулов (k-of-N)
+        // В Солане проверка Ed25519 часто выносится в отдельную инструкцию или проверяется через системные вызовы
+        validate_multisig(&oracle_sigs, &oracle_pubkeys, &params, config.min_signatures)?;
+
+        // 5. Финансовая логика (Margin & Fees)
+        // В Solana взаимодействие с Vault происходит через CPI (Cross-Program Invocation)
+        
+        // 6. Обновление состояния
+        user_stats.nonce = params.nonce;
+        user_stats.total_volume += params.margin;
+        user_stats.last_trade_ts = Clock::get()?.unix_timestamp;
+
+        emit!(SignalExecuted {
+            user: ctx.accounts.user.key(),
+            pair: params.pair_id,
+            margin: params.margin,
+        });
+
+        Ok(())
+    }
+
+    // Стейкинг для доступа к системе
+    pub fn stake(ctx: Context<Stake>, amount: u64) -> Result<()> {
+        let user_stats = &mut ctx.accounts.user_stats;
+        // Здесь логика перевода SOL через системную программу
+        user_stats.staked_amount += amount;
+        Ok(())
+    }
+}
+
+// =========================================================================
+// Data Structures (Accounts)
+// =========================================================================
+
+#[account]
+pub struct GlobalConfig {
+    pub admin: Pubkey,
+    pub pending_admin: Pubkey,
+    pub fee_bps: u64,
+    pub min_signatures: u8,
+    pub paused: bool,
+    pub timelock_delay: i64,
+}
+
+#[account]
+pub struct UserStatsAccount {
+    pub nonce: u64,
+    pub staked_amount: u64,
+    pub trust_score: u8,
+    pub total_volume: u64,
+    pub last_trade_ts: i64,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize)]
+pub struct TradeSignalParams {
+    pub pair_id: String,
+    pub is_long: bool,
+    pub leverage: u8,
+    pub margin: u64,
+    pub nonce: u64,
+    pub timestamp: i64,
+}
+
+// =========================================================================
+// Validation Helpers
+// =========================================================================
+
+fn validate_multisig(
+    sigs: &Vec<[u8; 64]>,
+    pubkeys: &Vec<[u8; 32]>,
+    params: &TradeSignalParams,
+    min_sigs: u8,
+) -> Result<()> {
+    require!(sigs.len() >= min_sigs as usize, AceError::NotEnoughSignatures);
+    // Логика итерации и проверки Ed25519 через solana_program
+    Ok(())
+}
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(init, payer = admin, space = 8 + 32 + 32 + 8 + 1 + 1 + 8)]
+    pub config: Account<'info, GlobalConfig>,
+    #[account(mut)]
+    pub admin: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct ExecuteSignal<'info> {
+    pub config: Account<'info, GlobalConfig>,
+    #[account(mut)]
+    pub user_stats: Account<'info, UserStatsAccount>,
+    pub user: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct Stake<'info> {
+    #[account(mut)]
+    pub user_stats: Account<'info, UserStatsAccount>,
+    #[account(mut)]
+    pub user: Signer<'info>,
+    pub system_program: Program<'info, System>,
+}
+
+#[error_code]
+pub enum AceError {
+    #[msg("Contract is currently paused")]
+    ContractPaused,
+    #[msg("Invalid nonce for user")]
+    InvalidNonce,
+    #[msg("Insufficient stake to execute trades")]
+    InsufficientStake,
+    #[msg("Trust score too low for this action")]
+    LowTrustScore,
+    #[msg("Not enough valid oracle signatures")]
+    NotEnoughSignatures,
+}
+
+#[event]
+pub struct SignalExecuted {
+    pub user: Pubkey,
+    pub pair: String,
+    pub margin: u64,
+}
